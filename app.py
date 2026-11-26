@@ -440,10 +440,10 @@ class ProxyPool:
     def _make_client(self, proxy_url):
         kwargs = dict(
             verify   = False,
-            timeout  = 15.0,
+            timeout  = 12.0,
             limits   = httpx.Limits(
-                max_connections            = 1000,
-                max_keepalive_connections  = 300,
+                max_connections            = 200,
+                max_keepalive_connections  = 50,
                 keepalive_expiry           = 60,
             ),
         )
@@ -492,37 +492,11 @@ else:
 # Direct client (UDP match traffic-এর জন্য — proxy দরকার নেই)
 client = proxy_pool._direct
 
-# ✅ ISOLATED MULTI-ACCOUNT HTTP CLIENTS — প্রতিটি অ্যাকাউন্টের সম্পূর্ণ আলাদা HTTP session/cookie
-# একটার সাথে একটার কোনো cookie বা connection state শেয়ার হবে না (200+ accounts VPS optimized)
-_ACCOUNT_HTTP_CLIENTS: Dict[str, httpx.AsyncClient] = {}
-
-def _get_account_http_client(uid: str) -> httpx.AsyncClient:
-    key = str(uid)
-    c = _ACCOUNT_HTTP_CLIENTS.get(key)
-    if c is None or c.is_closed:
-        c = httpx.AsyncClient(
-            verify=False,
-            timeout=15.0,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=5, keepalive_expiry=45),
-        )
-        _ACCOUNT_HTTP_CLIENTS[key] = c
-    else:
-        try:
-            c.cookies.clear()
-        except Exception:
-            pass
-    return c
-
-async def _close_account_http_client(uid: str):
-    c = _ACCOUNT_HTTP_CLIENTS.pop(str(uid), None)
-    if c and not c.is_closed:
-        try:
-            await c.aclose()
-        except Exception:
-            pass
-
-# ✅ FAST MULTI-ACCOUNT CONCURRENCY (Large VPS Optimized — 200+ accounts)
-_LOGIN_CONCURRENCY = int(os.environ.get("LOGIN_CONCURRENCY", "60"))
+# ✅ FIX: Login semaphore — একসাথে সর্বোচ্চ LOGIN_CONCURRENCY টি account লগইন করতে পারবে
+# version_config_cached থাকায় এখন 20 safe — Play Store scrape আর bottleneck নয়
+# ENV দিয়ে override করা যাবে: LOGIN_CONCURRENCY=30
+# ✅ FIX: 20→30 — তাড়াতাড়ি connect হবে, server rate limit এখনো safe
+_LOGIN_CONCURRENCY = int(os.environ.get("LOGIN_CONCURRENCY", "15"))  # ↓ 22→15: Railway RAM crash এড়াতে কমানো
 _LOGIN_SEMAPHORE = asyncio.Semaphore(_LOGIN_CONCURRENCY)
 
 headers = {
@@ -729,27 +703,18 @@ def _load_token_cache() -> Dict[str, Any]:
             pass
         return {}
 
-_token_cache_dirty: bool = False
-
-def _flush_token_cache_to_disk():
-    global _token_cache_dirty
-    if not _token_cache_memo:
-        return
+def _save_token_cache(cache: Dict[str, Any]):
+    global _token_cache_memo, _token_cache_memo_time
     try:
         os.makedirs(os.path.dirname(TOKEN_CACHE_FILE), exist_ok=True)
         tmp_file = TOKEN_CACHE_FILE + ".tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(dict(_token_cache_memo), f, indent=2, default=_json_serializer)
+            json.dump(cache, f, indent=2, default=_json_serializer)
         os.replace(tmp_file, TOKEN_CACHE_FILE)
-        _token_cache_dirty = False
+        _token_cache_memo = cache
+        _token_cache_memo_time = time.time()
     except Exception as e:
         print_error(f"Token cache save error: {e}")
-
-def _save_token_cache(cache: Dict[str, Any]):
-    global _token_cache_memo, _token_cache_memo_time, _token_cache_dirty
-    _token_cache_memo = cache
-    _token_cache_memo_time = time.time()
-    _token_cache_dirty = True
 
 def cache_get(uid: str) -> Optional[Dict]:
     cache = _load_token_cache()
@@ -927,11 +892,10 @@ async def get_access_token(uid, password):
         "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
         "client_id": "100067"
     }
-    acc_client = _get_account_http_client(str(uid))
     last_err = ""
     for attempt in range(5):
         try:
-            response = await acc_client.post(url, headers=hdrs, data=data)
+            response = await client.post(url, headers=hdrs, data=data)
             last_err = f"HTTP {response.status_code} {response.text[:150]}"
             if response.status_code == 200:
                 response_data = response.json()
@@ -3127,7 +3091,7 @@ async def account_loop_guest(uid: str, password: str):
                 # পুরনো: সবসময় 20-45s → 200 bot × 45s = 150 মিনিট CONNECTING
                 # নতুন: প্রথম 3 fail = 8-15s (version মিলছে না, তাড়াতাড়ি retry)
                 #        পরের fail = 20-45s (rate-limit বা network সমস্যা)
-                fail_count = bot_state.login_fail_counts.get(display_uid, 0)
+                fail_count = getattr(bot_state.accounts.get(display_uid, {}), 'get', lambda k, d=0: d)('login_fails', 0)
                 if fail_count <= 3:
                     retry_delay = random.uniform(8.0, 15.0)
                     print_error(f"Login failed for UID: {uid} (attempt {fail_count}). Retrying in {retry_delay:.0f}s...")
@@ -3278,7 +3242,7 @@ async def account_loop_token(token: str):
 # ==================== ACCOUNTS LOADER ====================
 
 def load_accounts():
-    """accounts*.json সব ফাইল থেকে শুধু uid ও password অটো লোড করে — duplicate বাদ দেয়"""
+    """accounts*.json সব ফাইল থেকে অটো লোড করে — duplicate বাদ দেয়"""
     accounts = []
     seen_uids = set()
     seen_tokens = set()
@@ -3289,28 +3253,23 @@ def load_accounts():
             continue
         try:
             with open(filepath, "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
-            data = raw_data.get("accounts") if isinstance(raw_data, dict) else raw_data
+                data = json.load(f)
             if not isinstance(data, list):
                 continue
             fname = os.path.basename(filepath)
             loaded = 0
             for acc in data:
-                if not isinstance(acc, dict):
-                    continue
-                if acc.get("uid") is not None and acc.get("password") is not None:
-                    uid = str(acc["uid"]).strip()
-                    pwd = str(acc["password"]).strip()
-                    if uid and pwd and uid not in seen_uids:
-                        seen_uids.add(uid)
-                        # ✅ শুধু uid এবং password নেওয়া হচ্ছে
-                        accounts.append({"uid": uid, "password": pwd})
-                        loaded += 1
-                elif "token" in acc and acc["token"]:
+                if "token" in acc and acc["token"]:
                     tok = str(acc["token"]).strip()
-                    if tok and tok not in seen_tokens:
+                    if tok not in seen_tokens:
                         seen_tokens.add(tok)
-                        accounts.append({"token": tok})
+                        accounts.append(acc)
+                        loaded += 1
+                elif "uid" in acc and "password" in acc and acc["uid"]:
+                    uid = str(acc["uid"]).strip()
+                    if uid not in seen_uids:
+                        seen_uids.add(uid)
+                        accounts.append(acc)
                         loaded += 1
             print_success(f"[LOADER] {fname} → {loaded} account(s) loaded")
         except Exception as e:
@@ -3326,17 +3285,12 @@ def load_accounts():
 # ==================== MAIN ====================
 
 async def _periodic_device_saver():
-    """✅ FIX: প্রতি 30s-এ dirty devices ও token cache file-এ save করে — I/O storm বন্ধ করে"""
+    """✅ FIX: প্রতি 60s-এ dirty devices cache file-এ save করে — I/O storm বন্ধ করে"""
     while True:
-        await asyncio.sleep(15)
+        await asyncio.sleep(60)
         if _DEVICES_DIRTY:
             try:
                 _save_devices_cache()
-            except Exception:
-                pass
-        if _token_cache_dirty:
-            try:
-                _flush_token_cache_to_disk()
             except Exception:
                 pass
 
@@ -3344,12 +3298,14 @@ async def _periodic_device_saver():
 _bg_tasks: list = []
 
 
-async def _launch_gate(max_wait: float = 3.0):
-    """Large VPS-এ লুপ খুব বেশি ব্যস্ত হলে সামান্য yield করে, নইলে সাথে সাথে লঞ্চ করে।"""
+async def _launch_gate(max_wait: float = 20.0):
+    """Event loop ব্যস্ত (lag বেশি) হলে নতুন আইডি লঞ্চ/লগইন কিছুক্ষণ থামায়।
+    এতে login-এর ConnectTimeout কমে, memory/CPU spike হয় না → Railway crash করে না।
+    loop ফাঁকা থাকলে কোনো অপেক্ষা নেই — আইডি দ্রুত কানেক্ট হয়।"""
     waited = 0.0
-    while get_loop_lag() > 1.5 and waited < max_wait:
-        await asyncio.sleep(0.25)
-        waited += 0.25
+    while get_loop_lag() > 0.6 and waited < max_wait:
+        await asyncio.sleep(1.0)
+        waited += 1.0
 
 
 async def main():
@@ -3411,31 +3367,25 @@ async def main():
     async def on_account_added_handler(data):
         if "token" in data and data["token"]:
             t = str(data["token"]).strip()
-            key = t[:10]
-            placeholder = f"tok_{key}"
-            bot_state.deleted_uids.discard(key)
+            placeholder = f"tok_{t[:10]}"
+            # ✅ Re-add করলে blacklist থেকে সরাও
+            bot_state.deleted_uids.discard(t[:10])
             bot_state.deleted_uids.discard(placeholder)
-            if key in bot_state.account_workers and not bot_state.account_workers[key].done():
-                return
             if placeholder not in bot_state.accounts:
-                bot_state.register_account(uid=placeholder, nickname=f"Token_{key}", region="BD", level=1, exp=0)
+                bot_state.register_account(uid=placeholder, nickname=f"Token_{t[:10]}", region="BD", level=1, exp=0)
             bot_state.update_status(placeholder, "CONNECTING")
-            await asyncio.sleep(0)
+            await asyncio.sleep(random.uniform(0.2, 0.6))  # ↑ 0.5-2.0 → 0.2-0.6s
             task = asyncio.create_task(account_loop_token(t))
-            bot_state.account_workers[key] = task
+            bot_state.account_workers[t[:10]] = task
         elif "uid" in data and "password" in data:
             u = str(data["uid"]).strip()
             p = str(data["password"]).strip()
-            if not u or not p:
-                return
+            # ✅ Re-add করলে blacklist থেকে সরাও
             bot_state.deleted_uids.discard(u)
-            real_key = bot_state.guest_alias.get(u, u)
-            if any(k in bot_state.account_workers and not bot_state.account_workers[k].done() for k in (u, real_key)):
-                return
             if u not in bot_state.accounts:
                 bot_state.register_account(uid=u, nickname=f"Player_{u[:6]}", region="BD", level=1, exp=0)
             bot_state.update_status(u, "CONNECTING")
-            await asyncio.sleep(0)
+            await asyncio.sleep(random.uniform(0.2, 0.6))  # ↑ 0.5-2.0 → 0.2-0.6s
             task = asyncio.create_task(account_loop_guest(u, p))
             bot_state.account_workers[u] = task
 
@@ -3444,20 +3394,21 @@ async def main():
 
     async def on_reload_accounts_handler():
         """
-        accounts*.json reload করে — ইতিমধ্যে চলমান নয় এমন accounts সুপার ফাস্ট চালু করে।
-        প্রতিটি অ্যাকাউন্ট সম্পূর্ণ আলাদা ও স্বাধীনভাবে চলে।
+        accounts*.json reload করে — ইতিমধ্যে চলমান নয় এমন accounts চালু করে।
+        deleted_uids আগেই dashboard_server.py-তে clear করা হয়েছে।
         """
         fresh_accounts = load_accounts()
         started = 0
-        _RB = max(1, int(os.environ.get("LAUNCH_BATCH_SIZE", "50")))
+        _RB = max(1, int(os.environ.get("LAUNCH_BATCH_SIZE", "20")))  # ↑ 12→20: main launch-এর সাথে consistent
         for acc in fresh_accounts:
             if started and started % _RB == 0:
                 await _launch_gate()
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(1.0)
             if "token" in acc and acc["token"]:
                 t = str(acc["token"]).strip()
                 key = t[:10]
                 placeholder = f"tok_{key}"
+                # ইতিমধ্যে চলমান হলে skip
                 if key in bot_state.account_workers and not bot_state.account_workers[key].done():
                     continue
                 bot_state.deleted_uids.discard(key)
@@ -3465,13 +3416,14 @@ async def main():
                 if placeholder not in bot_state.accounts:
                     bot_state.register_account(uid=placeholder, nickname=f"Token_{key}", region="BD", level=1, exp=0)
                 bot_state.update_status(placeholder, "CONNECTING")
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(random.uniform(0.05, 0.25))
                 task = asyncio.create_task(account_loop_token(t))
                 bot_state.account_workers[key] = task
                 started += 1
             elif "uid" in acc and "password" in acc and acc["uid"]:
                 u = str(acc["uid"]).strip()
                 p = str(acc["password"]).strip()
+                # ইতিমধ্যে চলমান হলে skip (worker key login-এর পর real account id হয়ে যায়, তাই alias-ও দেখা হয়)
                 real_key = bot_state.guest_alias.get(u, u)
                 if any(k in bot_state.account_workers and not bot_state.account_workers[k].done() for k in (u, real_key)):
                     continue
@@ -3480,7 +3432,7 @@ async def main():
                 if u not in bot_state.accounts:
                     bot_state.register_account(uid=u, nickname=f"Player_{u[:6]}", region="BD", level=1, exp=0)
                 bot_state.update_status(u, "CONNECTING")
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(random.uniform(0.05, 0.25))
                 task = asyncio.create_task(account_loop_guest(u, p))
                 bot_state.account_workers[u] = task
                 started += 1
@@ -3496,7 +3448,8 @@ async def main():
         print_warning(f"No accounts found in any accounts*.json file! Add accounts from Web Dashboard.")
         print_warning(f"Open: http://localhost:{WEB_PORT}")
 
-    # ✅ Pre-register ALL accounts immediately so dashboard shows them from startup
+    # ✅ FIX: Pre-register ALL accounts immediately so dashboard shows them from startup
+    # ✅ FIX2: deleted_uids-এ থাকলে skip — redeploy-এর পর level-limit আইডি আর "Connecting" দেখাবে না
     for acc in accounts:
         if "token" in acc and acc["token"]:
             placeholder = f"tok_{acc['token'][:10]}"
@@ -3511,12 +3464,17 @@ async def main():
             bot_state.register_account(uid=u, nickname=f"Player_{u[:6]}", region="BD", level=1, exp=0)
             bot_state.update_status(u, "CONNECTING")
 
-    # ✅ SUPER-FAST MULTI-ACCOUNT BATCH LAUNCH SYSTEM (Large VPS — 200+ isolated accounts)
-    BATCH_SIZE = int(os.environ.get("LAUNCH_BATCH_SIZE", "50"))
-    BATCH_DELAY = float(os.environ.get("LAUNCH_BATCH_DELAY", "0.25"))
+    # ✅ FIX: BATCH LAUNCH SYSTEM — 500 আইডির জন্য smart batch system
+    # প্রতি batch-এ BATCH_SIZE টি account একসাথে launch হয়
+    # Batch-এর মধ্যে BATCH_DELAY সেকেন্ড gap দেওয়া হয়
+    # এটি Railway-তে memory spike বন্ধ করে এবং crash ঠিক করে
+    # ✅ FIX: Batch size বাড়ানো 10→20, delay কমানো 5.0→2.0
+    # version_config_cached থাকায় এখন বড় batch safe — একটাই version scrape হয়
+    BATCH_SIZE = int(os.environ.get("LAUNCH_BATCH_SIZE", "20"))   # ↑ 12→20: দ্রুত launch
+    BATCH_DELAY = float(os.environ.get("LAUNCH_BATCH_DELAY", "1.2"))  # ↑ 2.0→1.2s: faster batch gap
 
     total = len(accounts)
-    print_info(f"[LAUNCHER] Starting {total} isolated accounts in fast batches of {BATCH_SIZE} (delay: {BATCH_DELAY}s)")
+    print_info(f"[LAUNCHER] Starting {total} accounts in batches of {BATCH_SIZE} (delay: {BATCH_DELAY}s between batches)")
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = accounts[batch_start: batch_start + BATCH_SIZE]
@@ -3527,80 +3485,36 @@ async def main():
             if "token" in acc and acc["token"]:
                 t_key = acc["token"][:10]
                 placeholder = f"tok_{t_key}"
+                # ✅ FIX: deleted_uids-এ থাকলে worker শুরু করবে না
                 if placeholder in bot_state.deleted_uids or t_key in bot_state.deleted_uids:
                     continue
-                if t_key not in bot_state.account_workers or bot_state.account_workers[t_key].done():
-                    t = asyncio.create_task(account_loop_token(acc["token"]))
-                    bot_state.account_workers[t_key] = t
+                t = asyncio.create_task(account_loop_token(acc["token"]))
+                bot_state.account_workers[t_key] = t
             elif "uid" in acc and "password" in acc and acc["uid"]:
                 u = str(acc["uid"])
+                # ✅ FIX: deleted_uids-এ থাকলে worker শুরু করবে না
                 if u in bot_state.deleted_uids:
                     continue
-                real_key = bot_state.guest_alias.get(u, u)
-                if not any(k in bot_state.account_workers and not bot_state.account_workers[k].done() for k in (u, real_key)):
-                    t = asyncio.create_task(account_loop_guest(u, acc["password"]))
-                    bot_state.account_workers[u] = t
-            await asyncio.sleep(random.uniform(0.01, 0.04))
+                t = asyncio.create_task(account_loop_guest(u, acc["password"]))
+                bot_state.account_workers[u] = t
+            # ✅ FIX: প্রতিটা account launch-এর মাঝে ছোট gap — login storm এড়াতে
+            await asyncio.sleep(random.uniform(0.05, 0.25))
 
         print_info(f"[LAUNCHER] Batch {batch_num}/{total_batches} launched ({len(batch)} accounts)")
 
+        # Last batch-এর পর আর sleep নেই
         if batch_start + BATCH_SIZE < total:
             await asyncio.sleep(BATCH_DELAY)
-            await _launch_gate()
-
-    # ✅ 24/7 NON-STOP WATCHDOG — কোনো অ্যাকাউন্টের worker থেমে গেলে অটো রিস্টার্ট করবে (একটার সাথে একটার কোনো সংযোগ নেই)
-    async def _account_watchdog_24x7():
-        while True:
-            await asyncio.sleep(15)
-            try:
-                active_accs = load_accounts()
-                restarted = 0
-                for acc in active_accs:
-                    if "uid" in acc and "password" in acc and acc["uid"]:
-                        u = str(acc["uid"]).strip()
-                        real_key = bot_state.guest_alias.get(u, u)
-                        if u in bot_state.deleted_uids or real_key in bot_state.deleted_uids:
-                            continue
-                        is_alive = any(
-                            k in bot_state.account_workers and not bot_state.account_workers[k].done()
-                            for k in (u, real_key)
-                        )
-                        if not is_alive:
-                            task = asyncio.create_task(account_loop_guest(u, acc["password"]))
-                            bot_state.account_workers[u] = task
-                            restarted += 1
-                            await asyncio.sleep(0.02)
-                    elif "token" in acc and acc["token"]:
-                        tok = str(acc["token"]).strip()
-                        t_key = tok[:10]
-                        placeholder = f"tok_{t_key}"
-                        if t_key in bot_state.deleted_uids or placeholder in bot_state.deleted_uids:
-                            continue
-                        w = bot_state.account_workers.get(t_key)
-                        if w is None or w.done():
-                            task = asyncio.create_task(account_loop_token(tok))
-                            bot_state.account_workers[t_key] = task
-                            restarted += 1
-                            await asyncio.sleep(0.02)
-                if restarted > 0:
-                    print_info(f"[24/7 WATCHDOG] Auto-restarted {restarted} isolated account worker(s)")
-            except Exception as _we:
-                print_error(f"[24/7 WATCHDOG] Check error: {_we}")
-
-    _bg_tasks.append(asyncio.create_task(_account_watchdog_24x7()))
+            await _launch_gate()   # loop ব্যস্ত থাকলে অপেক্ষা, ফাঁকা থাকলে সাথে সাথে পরের batch
 
     try:
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(1)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print_warning("\n[STOP] Shutting down all accounts...")
         for t in list(bot_state.account_workers.values()):
             t.cancel()
         await asyncio.gather(*bot_state.account_workers.values(), return_exceptions=True)
-        if _DEVICES_DIRTY:
-            _save_devices_cache()
-        if _token_cache_dirty:
-            _flush_token_cache_to_disk()
         print_success("All sessions cleanly closed.")
 
 
@@ -4006,7 +3920,6 @@ async def functional_br_evo(addrs, auth_packet, key, iv, account_id,
         writer = None
         reader = None
         hb_task = None
-        hb_stop = None
 
         try:
             cap = _mehedi_get_cap(uid_str)
@@ -4205,22 +4118,12 @@ async def functional_br_evo(addrs, auth_packet, key, iv, account_id,
                 return
             _blog(f"Error ({uid_str}): {_es[:120]}", "warning")
             reconnects += 1
-            if reconnects >= 6:
-                # 24/7 Auto-Recovery: JWT token expired হলে cache clear করে fresh re-login করাবে
-                _blog(f"6x consecutive TCP disconnects for UID {uid_str} — refreshing login token", "warning")
-                try:
-                    cred = bot_state.account_credentials.get(uid_str)
-                    if cred and cred.get("auth_uid"):
-                        cache_invalidate(str(cred["auth_uid"]))
-                    cache_invalidate(uid_str)
-                except Exception:
-                    pass
-                break
+            if reconnects > max_reconnects:
+                reconnects = 0
 
         finally:
             if hb_task:
-                if hb_stop:
-                    hb_stop.set()
+                hb_stop.set() if 'hb_stop' in dir() else None
                 try:
                     hb_task.cancel()
                     await hb_task
